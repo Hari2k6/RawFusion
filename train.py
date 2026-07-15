@@ -1,184 +1,195 @@
-"""
-We refer the code made from  
-https://github.com/z-bingo/kernel-prediction-networks-PyTorch/blob/master/train_eval_syn.py
-"""
-
-
-
+import os
+import cv2
 import torch
-import torch.optim as optim
-from torch.optim import lr_scheduler
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 import numpy as np
-import argparse
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
+from tqdm import tqdm
+import time
 
-import os, sys, time, shutil
+from model_zoo.simple_burst_model import SimpleBurstModel
 
-from PIL import Image
-from torchvision.transforms import transforms
-to_pil_image = transforms.ToPILImage()
+# -----------------------
+# Dataset Classes
+# -----------------------
+class BurstDatasetAuto(Dataset):
+    def __init__(self, root_dirs, transform=transforms.ToTensor()):
+        self.transform = transform
+        self.bursts = []  # list of 9-frame input paths
+        self.gt_files = {}  # scene -> gt path
 
-from DataLoader.custom_data_class import CustomDataset
-from models.unet_model import UNet
-import pdb
+        # collect GT images
+        for d in root_dirs:
+            for f in os.listdir(d):
+                if "-gt" in f:
+                    scene = f.split("-gt")[0]
+                    self.gt_files[scene] = os.path.join(d, f)
 
-from utils.utils import *
-from utils.checkpoint import *
+        # collect input frames and group by scene
+        temp_bursts = {}
+        for d in root_dirs:
+            for f in os.listdir(d):
+                if "-in-" in f:
+                    scene = f.split("-in-")[0]
+                    temp_bursts.setdefault(scene, []).append(os.path.join(d, f))
 
-def train(num_threads, cuda, restart_train, mGPU):
-    torch.set_num_threads(num_threads)
+        # keep only bursts with GT and full 9 frames
+        for scene, frames in temp_bursts.items():
+            if scene in self.gt_files and len(frames) == 9:
+                frames_sorted = sorted(frames, key=lambda x: int(x.split("-in-")[1].split(".")[0]))
+                self.bursts.append((frames_sorted, self.gt_files[scene]))
 
-    batch_size = 8
-    lr_decay = 0.95
-    lr = 2e-4
+    def __len__(self):
+        return len(self.bursts)
 
-    n_epoch = 100000
+    def __getitem__(self, idx):
+        frames_paths, gt_path = self.bursts[idx]
+        imgs = []
+        for p in frames_paths:
+            img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if self.transform:
+                img = self.transform(img)
+            imgs.append(img)
+        burst = torch.stack(imgs)
 
-    # checkpoint path
-    checkpoint_dir = 'checkpoint_dir'
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    # output path
-    output_dir = 'output'
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    # logs path
-    logs_dir = 'logs_dir'
-    if not os.path.exists(logs_dir):
-        os.makedirs(logs_dir)
-    shutil.rmtree(logs_dir)
+        gt = cv2.imread(gt_path, cv2.IMREAD_UNCHANGED)
+        gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+        if self.transform:
+            gt = self.transform(gt)
 
-    # dataset and dataloader
-    data_set = CustomDataset(root_dir="../datasets/trn/", transform=transforms.ToTensor(), train=True)
-    data_loader = torch.utils.data.DataLoader(data_set, batch_size=batch_size, shuffle=False)
-    print("Length of the data_loader :", len(data_loader))
-    # model here
-    model = UNet(in_channels=9,  # 9 frames considered as channel dimension
-        n_classes=3,        # out channels (RGB)
-        depth=4,
-        wf=6,
-        padding=True,
-        batch_norm=False,
-        up_mode='upconv')
+        return burst, gt
 
-    print('\n-------Training started -------\n')
+class ValidationInputDataset(Dataset):
+    def __init__(self, root_dir, transform=transforms.ToTensor()):
+        self.files = sorted([f for f in os.listdir(root_dir) if "-in-" in f])
+        self.root_dir = root_dir
+        self.transform = transform
 
-    if cuda:
-        model = model.cuda()
+    def __len__(self):
+        return len(self.files) // 9
 
-    if mGPU:
-        model = nn.DataParallel(model)
-    model.train()
+    def __getitem__(self, idx):
+        imgs = []
+        for i in range(9):
+            img_path = os.path.join(self.root_dir, self.files[idx*9 + i])
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            if self.transform:
+                img = self.transform(img)
+            imgs.append(img)
+        return torch.stack(imgs)
 
+class ValidationGTDataset(Dataset):
+    def __init__(self, root_dir, transform=transforms.ToTensor()):
+        self.files = sorted([f for f in os.listdir(root_dir) if "-gt" in f])
+        self.root_dir = root_dir
+        self.transform = transform
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    optimizer.zero_grad()
-    scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=lr_decay)
+    def __len__(self):
+        return len(self.files)
 
-    average_loss = MovingAverage(200)
-    if not restart_train:
-        try:
-            checkpoint = load_checkpoint(checkpoint_dir, 'best')
-            start_epoch = checkpoint['epoch']
-            global_step = checkpoint['global_iter']
-            best_loss = checkpoint['best_loss']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            print('=> loaded checkpoint (epoch {}, global_step {})'.format(start_epoch, global_step))
-        except:
-            start_epoch = 0
-            global_step = 0
-            best_loss = np.inf
-            print('=> no checkpoint file to be loaded.')
-    else:
-        start_epoch = 0
-        global_step = 0
-        best_loss = np.inf
-        if os.path.exists(checkpoint_dir):
-            pass
-        else:
-            os.mkdir(checkpoint_dir)
-        print('=> training')
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.files[idx])
+        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.transform:
+            img = self.transform(img)
+        return img
 
-    MSE_loss = nn.MSELoss()
-    
+# -----------------------
+# Utility Functions
+# -----------------------
+def tensor_to_numpy(img_tensor):
+    img = img_tensor.cpu().numpy().transpose(1,2,0)
+    return np.clip(img*255, 0, 255).astype(np.uint8)
 
-    for epoch in range(start_epoch, n_epoch):
-        epoch_start_time = time.time()
-        print('='*20, 'lr={}'.format([param['lr'] for param in optimizer.param_groups]), '='*20)
-        avg_loss = 0
-        avg_psnr = 0
-        avg_ssim = 0
-        avg_step = 0
-        for step, (burst_noise, gt) in enumerate(data_loader):
-            t0 = time.time()
-            if cuda:
-                burst_noise = burst_noise.cuda()
-                gt = gt.cuda()
-            burst_noise = burst_noise.squeeze(2)
-            pred = model(burst_noise)
-            loss = MSE_loss(pred, gt)
+def validate(model, input_loader, gt_loader, device):
+    model.eval()
+    psnr_total, ssim_total = 0.0, 0.0
+    with torch.no_grad():
+        for burst, gt in zip(input_loader, gt_loader):
+            burst = burst.to(device)
+            gt = gt.to(device)
+            pred = model(burst)
+
+            pred_np = tensor_to_numpy(pred.squeeze(0))
+            gt_np = tensor_to_numpy(gt.squeeze(0))
+
+            psnr_total += compare_psnr(gt_np, pred_np, data_range=255)
+            ssim_total += compare_ssim(gt_np, pred_np, data_range=255, channel_axis=2)
+    n = len(input_loader)
+    return psnr_total/n, ssim_total/n
+
+# -----------------------
+# Main Training
+# -----------------------
+if __name__ == "__main__":
+    # Config
+    train_dirs = ["train1", "train2"]
+    val_input_dir = "validation_input"
+    val_gt_dir = "validation_gt"
+    batch_size = 4
+    num_epochs = 20
+    learning_rate = 1e-4
+    save_dir = "models"
+    os.makedirs(save_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # DataLoaders
+    train_dataset = BurstDatasetAuto(train_dirs, transform=transforms.ToTensor())
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    val_input_dataset = ValidationInputDataset(val_input_dir, transform=transforms.ToTensor())
+    val_gt_dataset = ValidationGTDataset(val_gt_dir, transform=transforms.ToTensor())
+    val_input_loader = DataLoader(val_input_dataset, batch_size=1, shuffle=False)
+    val_gt_loader = DataLoader(val_gt_dataset, batch_size=1, shuffle=False)
+
+    # Model, Loss, Optimizer
+    model = SimpleBurstModel().to(device)
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Training Loop with progress bar
+    best_psnr = 0.0
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        start_time = time.time()
+
+        for batch_idx, (burst, gt) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            burst = burst.to(device)
+            gt = gt.to(device)
+
             optimizer.zero_grad()
+            output = model(burst)
+            loss = criterion(output, gt)
             loss.backward()
             optimizer.step()
-            average_loss.update(loss)
-            # pdb.set_trace()
-            psnr = calculate_psnr(pred.unsqueeze(1), gt.unsqueeze(1))
-            ssim = calculate_ssim(pred.unsqueeze(1), gt.unsqueeze(1))
-            avg_loss += loss.item()
-            avg_psnr += psnr
-            avg_ssim += ssim
-            avg_step += 1
-            t1 = time.time()
-            # save images
-            if (epoch % 50 == 0) and (step < 20):
-                for frame in range(9):
-                    pil_image = to_pil_image(burst_noise[0][frame])
-                    pil_image.save(f'./{output_dir}/Batch{step}_input{frame}.png')
-                pil_image = to_pil_image(gt[0])
-                pil_image.save(f'./{output_dir}/Batch{step}_gt.png')
-                pil_image = to_pil_image(pred[0])
-                pil_image.save(f'./{output_dir}/Batch{step}_output_E{epoch}.png')
-            # print
-            if step % 5 == 0:
-                print('{:-4d}\t| epoch {:2d}\t| step {:4d}\t|'
-                      ' loss: {:.4f}\t| PSNR: {:.2f}dB\t| SSIM: {:.4f}\t| time:{:.2f} seconds.'
-                      .format(global_step, epoch, step, loss, psnr, ssim, t1-t0))
-            global_step += 1
-        print('Epoch {} is finished, time elapsed {:.2f} seconds.'.format(epoch, time.time() - epoch_start_time))
-        print('Average loss : {:.5f}\t| Average PSNR : {:.3f}\t| Average SSIM : {:.3f} \n'.format(avg_loss/avg_step, avg_psnr/avg_step, avg_ssim/avg_step))
-        if epoch % 5 == 0:
-            if average_loss.get_value() < best_loss:
-                is_best = True
-                best_loss = average_loss.get_value()
-            else:
-                is_best = False
+            running_loss += loss.item()
 
-            save_dict = {
-                'epoch': epoch,
-                'global_iter': global_step,
-                'state_dict': model.state_dict(),
-                'best_loss': best_loss,
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': scheduler.state_dict()
-            }
-            save_checkpoint(
-                save_dict, is_best, checkpoint_dir, global_step, max_keep=5
-            )
+        epoch_time = time.time() - start_time
+        avg_loss = running_loss / len(train_loader)
+        remaining_epochs = num_epochs - (epoch + 1)
+        est_remaining_time = remaining_epochs * epoch_time
+        est_min, est_sec = divmod(est_remaining_time, 60)
 
+        print(f"\nEpoch [{epoch+1}/{num_epochs}] - Train Loss: {avg_loss:.6f} | "
+              f"Epoch Time: {epoch_time:.1f}s | Estimated Remaining: {int(est_min)}m {int(est_sec)}s")
 
-        # decay the learning rate
-        lr_cur = [param['lr'] for param in optimizer.param_groups]
-        if lr_cur[0] > 5e-6:
-            scheduler.step()
-        else:
-            for param in optimizer.param_groups:
-                param['lr'] = 5e-6
+        # Validation
+        psnr, ssim = validate(model, val_input_loader, val_gt_loader, device)
+        print(f"Validation PSNR: {psnr:.4f} dB | SSIM: {ssim:.4f}")
 
+        # Save best model
+        if psnr > best_psnr:
+            best_psnr = psnr
+            best_path = os.path.join(save_dir, "best_burst_model.pth")
+            torch.save(model.state_dict(), best_path)
+            print(f"Saved BEST model: {best_path}")
 
-
-if __name__ == '__main__':
-    train(num_threads=1, cuda=True, restart_train=False, mGPU=2)
+    print("Training completed!")
