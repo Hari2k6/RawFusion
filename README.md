@@ -384,6 +384,10 @@ The implementation builds upon concepts from modern Burst HDR restoration resear
 
 Special thanks to the authors of the original **RawFusion / NTIRE Burst HDR** benchmark for providing the research foundation and dataset that enabled this work.
 
+This project is based on the RawFusion framework developed for the NTIRE Burst HDR Challenge.
+
+The original implementation served as the research baseline, while this repository focuses on implementing, training, evaluating, and documenting an efficient lightweight Burst HDR restoration pipeline.
+
 ---
 
 ⭐ If you found this repository useful, consider giving it a star!
